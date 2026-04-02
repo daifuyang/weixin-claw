@@ -1,0 +1,25 @@
+{
+  "name": "weixin-claw",
+  "version": "0.1.0",
+  "description": "微信 clawbot 对话工具 — 支持定时任务、AI 集成、消息通知",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "wx": "tsx src/cli/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "croner": "^10.0.1",
+    "marked": "^17.0.5",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  },
+  "packageManager": "pnpm@8.15.9+sha512.499434c9d8fdd1a2794ebf4552b3b25c0a633abcee5bb15e7b5de90f32f47b513aca98cd5cfd001c31f0db454bc3804edccd578501e4ca293a6816166bbd9f81"
+}
