@@ -146,6 +146,15 @@ export class WeixinClient {
       const count = resp.msgs?.length ?? 0;
       if (count > 0) {
         console.log(`\x1b[90m[drain]\x1b[0m 丢弃 ${count} 条历史消息`);
+        for (const msg of resp.msgs!) {
+          const text = msg.item_list
+            ?.map((item) => item.text_item?.text)
+            .filter(Boolean)
+            .join(" ") || "(非文本)";
+          const preview = text.length > 80 ? text.slice(0, 80) + "..." : text;
+          const from = msg.from_user_id || "unknown";
+          console.log(`\x1b[90m[drain]\x1b[0m   └ [${from}] ${preview}`);
+        }
       }
     } catch {
       // 超时说明没有积压消息，属于正常情况

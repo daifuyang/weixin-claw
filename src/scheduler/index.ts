@@ -81,7 +81,7 @@ function log(msg: string): void {
   console.log(`\x1b[90m[${ts}]\x1b[0m ${msg}`);
 }
 
-function runOpencode(prompt: string, timeoutMs = 120_000): Promise<string> {
+function runOpencode(prompt: string, timeoutMs = 24 * 60 * 60_000): Promise<string> {
   return new Promise((resolve) => {
     const escaped = prompt.replace(/'/g, "'\\''");
     const child = spawn("opencode", ["run", `${escaped}`], {
@@ -110,10 +110,13 @@ function runOpencode(prompt: string, timeoutMs = 120_000): Promise<string> {
 }
 
 
+const LINK_HINT = "（重要：回复中所有新闻/文章/话题必须用Markdown链接格式附带可访问的原始出处链接，如 [标题](https://具体文章url)。链接必须指向具体文章页面，严禁使用网站首页。如果找不到精确原文链接，请用搜索引擎链接代替，格式如：[标题](https://www.google.com/search?q=关键词)）";
+
 function executeTask(task: ScheduledTask, client: WeixinClient): void {
   log(`⏰ 执行定时任务 #${task.id}: ${task.description}`);
+  const fullPrompt = task.prompt + LINK_HINT;
 
-  runOpencode(task.prompt).then((result) => {
+  runOpencode(fullPrompt).then((result) => {
     const cleaned = md2wx(result);
     log(`✅ 任务 #${task.id} 完成 (${cleaned.length} 字符)`);
 

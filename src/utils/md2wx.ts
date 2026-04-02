@@ -29,7 +29,7 @@ function buildMarked(): Marked {
       },
 
       strong({ tokens }: Tokens.Strong) {
-        return `<b>${this.parser.parseInline(tokens)}</b>`;
+        return `「${this.parser.parseInline(tokens)}」`;
       },
 
       em({ tokens }: Tokens.Em) {

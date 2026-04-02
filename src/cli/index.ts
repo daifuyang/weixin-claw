@@ -2,7 +2,7 @@
 
 import { parseArgs } from "node:util";
 import readline from "node:readline";
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -337,7 +337,33 @@ async function cmdTask(argv: string[]): Promise<void> {
   log("✅ 结果已推送到微信");
 }
 
-const AGENT_TIMEOUT_MS = 120_000;
+const AGENT_TIMEOUT_MS = 24 * 60 * 60_000;
+
+function runShellAsync(cmd: string, timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("/bin/sh", ["-c", cmd], {
+      timeout: timeoutMs,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout.trim());
+      } else {
+        reject(new Error(`exit ${code}: ${stderr.trim() || stdout.trim()}`));
+      }
+    });
+
+    child.on("error", (err) => {
+      reject(err);
+    });
+  });
+}
 
 interface AgentAction {
   type: string;
@@ -396,13 +422,18 @@ function parseOpencodeOutput(raw: string): { sessionId: string; text: string } {
 
 function buildOpencodeCmd(message: string, sessionId: string | null, userId?: string): string {
   let content = message;
+  const hints: string[] = [
+    "[格式提示: 回复中涉及新闻/文章/话题时，必须用Markdown链接格式附带可访问的原始出处链接，如 [标题](https://具体文章url)。链接必须指向具体文章页面，严禁使用网站首页。如果找不到精确原文链接，请用搜索引擎链接代替，格式如：[标题](https://www.google.com/search?q=关键词)。系统会自动转换为微信可点击的超链接。]",
+  ];
   if (userId) {
     const tasks = listSchedules(userId);
     if (tasks.length > 0) {
       const taskList = tasks.map((t) => `#${t.id} ${t.description} (${t.cron})`).join("\n");
-      content = `[当前定时任务]\n${taskList}\n[/当前定时任务]\n[提示: 你可以用 <!--ACTION:cancel{"task_id":ID}--> 取消任务，用 <!--ACTION:schedule{...}--> 创建任务，用 <!--ACTION:remind{...}--> 设置提醒。请加载 weixin-assistant skill 了解详情。]\n\n${message}`;
+      hints.unshift(`[当前定时任务]\n${taskList}\n[/当前定时任务]`);
+      hints.push("[提示: 你可以用 <!--ACTION:cancel{\"task_id\":ID}--> 取消任务，用 <!--ACTION:schedule{...}--> 创建任务，用 <!--ACTION:remind{...}--> 设置提醒。请加载 weixin-assistant skill 了解详情。]");
     }
   }
+  content = hints.join("\n") + "\n\n" + message;
   const escaped = content.replace(/'/g, "'\\''");
   const parts = ["opencode", "run", "--format", "json"];
   if (sessionId) {
@@ -551,11 +582,7 @@ async function cmdAgent(): Promise<void> {
       const cmd = buildOpencodeCmd(text, existingSession, from);
       let raw: string;
       try {
-        raw = execSync(cmd, {
-          timeout: AGENT_TIMEOUT_MS,
-          encoding: "utf-8",
-          maxBuffer: 10 * 1024 * 1024,
-        }).trim();
+        raw = await runShellAsync(cmd, AGENT_TIMEOUT_MS);
       } catch (err) {
         await stopTyping();
         const errMsg = `处理失败: ${String(err)}`;
