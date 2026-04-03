@@ -1,5 +1,9 @@
 import crypto from "node:crypto";
 
+import { isDebug } from "../utils/paths.js";
+
+const IS_DEBUG = isDebug();
+
 import { apiPost } from "./api.js";
 import { loadCredentials, saveCredentials, qrLogin } from "./auth.js";
 import type {
@@ -66,7 +70,7 @@ export class WeixinClient {
     const cred = await this.ensureLogin();
     const contextToken = getContextToken(to);
     const clientId = `weixin-claw:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-    console.log(`\x1b[90m[send]\x1b[0m → ${to.split("@")[0]} (clientId=${clientId.slice(-12)})`);
+    if (IS_DEBUG) console.log(`\x1b[90m[send]\x1b[0m → ${to.split("@")[0]} (clientId=${clientId.slice(-12)})`);
     const body = JSON.stringify({
       msg: {
         from_user_id: "",
@@ -79,6 +83,13 @@ export class WeixinClient {
       },
     });
     await apiPost(cred.baseUrl, "ilink/bot/sendmessage", body, cred.token);
+  }
+
+  async sendChunks(to: string, chunks: string[], delayMs = 300): Promise<void> {
+    for (let i = 0; i < chunks.length; i++) {
+      await this.send(to, chunks[i]);
+      if (i < chunks.length - 1) await sleep(delayMs);
+    }
   }
 
   async getTypingTicket(userId: string): Promise<string | null> {
@@ -146,14 +157,16 @@ export class WeixinClient {
       const count = resp.msgs?.length ?? 0;
       if (count > 0) {
         console.log(`\x1b[90m[drain]\x1b[0m 丢弃 ${count} 条历史消息`);
-        for (const msg of resp.msgs!) {
-          const text = msg.item_list
-            ?.map((item) => item.text_item?.text)
-            .filter(Boolean)
-            .join(" ") || "(非文本)";
-          const preview = text.length > 80 ? text.slice(0, 80) + "..." : text;
-          const from = msg.from_user_id || "unknown";
-          console.log(`\x1b[90m[drain]\x1b[0m   └ [${from}] ${preview}`);
+        if (IS_DEBUG) {
+          for (const msg of resp.msgs!) {
+            const text = msg.item_list
+              ?.map((item) => item.text_item?.text)
+              .filter(Boolean)
+              .join(" ") || "(非文本)";
+            const preview = text.length > 80 ? text.slice(0, 80) + "..." : text;
+            const from = msg.from_user_id || "unknown";
+            console.log(`\x1b[90m[drain]\x1b[0m   └ [${from}] ${preview}`);
+          }
         }
       }
     } catch {

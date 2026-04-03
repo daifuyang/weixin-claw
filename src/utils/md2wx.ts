@@ -120,10 +120,8 @@ function buildMarked(): Marked {
         return this.parser.parseInline(token.tokens);
       },
 
-      link({ href, tokens }: Tokens.Link) {
-        const text = this.parser.parseInline(tokens);
-        if (!href || href === text) return text;
-        return `<a href="${href}">${text}</a>`;
+      link({ tokens }: Tokens.Link) {
+        return this.parser.parseInline(tokens);
       },
 
       image({ text }: Tokens.Image) {
@@ -163,4 +161,40 @@ const wxMarked = buildMarked();
 export function md2wx(markdown: string): string {
   const raw = wxMarked.parse(markdown) as string;
   return raw.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+const MIN_CHUNK_LEN = 60;
+
+const SECTION_RE = /^(📌 |▎|▸ |──────────$|「[^」]+」$)/;
+
+function isSectionStart(line: string): boolean {
+  return SECTION_RE.test(line.trim());
+}
+
+export function splitForWeChat(wxText: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+
+  for (const line of wxText.split("\n")) {
+    if (isSectionStart(line) && current.trim()) {
+      segments.push(current.trim());
+      current = line + "\n";
+    } else {
+      current += line + "\n";
+    }
+  }
+  if (current.trim()) segments.push(current.trim());
+
+  if (segments.length <= 1) return segments.length ? segments : [wxText];
+
+  const merged: string[] = [];
+  for (const seg of segments) {
+    if (merged.length > 0 && seg.length < MIN_CHUNK_LEN) {
+      merged[merged.length - 1] += "\n\n" + seg;
+    } else {
+      merged.push(seg);
+    }
+  }
+
+  return merged;
 }

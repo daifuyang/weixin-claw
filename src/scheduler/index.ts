@@ -1,14 +1,11 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { Cron } from "croner";
 
 import { WeixinClient } from "../client/index.js";
-import { md2wx } from "../utils/md2wx.js";
-
-const SCHEDULES_DIR = path.join(os.homedir(), "weixin-claw");
-const SCHEDULES_FILE = path.join(SCHEDULES_DIR, "schedules.json");
+import { md2wx, splitForWeChat } from "../utils/md2wx.js";
+import { DATA_DIR, SCHEDULES_FILE } from "../utils/paths.js";
 
 export interface ScheduledTask {
   id: number;
@@ -29,7 +26,7 @@ function loadSchedules(): ScheduledTask[] {
 }
 
 function saveSchedules(tasks: ScheduledTask[]): void {
-  fs.mkdirSync(SCHEDULES_DIR, { recursive: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.writeFileSync(SCHEDULES_FILE, JSON.stringify(tasks, null, 2), "utf-8");
 }
 
@@ -110,25 +107,29 @@ function runOpencode(prompt: string, timeoutMs = 24 * 60 * 60_000): Promise<stri
 }
 
 
-const LINK_HINT = "（重要：回复中所有新闻/文章/话题必须用Markdown链接格式附带可访问的原始出处链接，如 [标题](https://具体文章url)。链接必须指向具体文章页面，严禁使用网站首页。如果找不到精确原文链接，请用搜索引擎链接代替，格式如：[标题](https://www.google.com/search?q=关键词)）";
-
 function executeTask(task: ScheduledTask, client: WeixinClient): void {
   log(`⏰ 执行定时任务 #${task.id}: ${task.description}`);
-  const fullPrompt = task.prompt + LINK_HINT;
 
-  runOpencode(fullPrompt).then((result) => {
+  runOpencode(task.prompt).then((result) => {
     const cleaned = md2wx(result);
     log(`✅ 任务 #${task.id} 完成 (${cleaned.length} 字符)`);
 
     const maxLen = 4000;
-    const truncated =
-      cleaned.length > maxLen
-        ? cleaned.slice(0, maxLen) + "\n...(已截断)"
-        : cleaned || "(无输出)";
+    const header = `⏰ 定时任务 #${task.id}\n📋 ${task.description}`;
+    let chunks: string[];
+    if (cleaned.trim()) {
+      chunks = splitForWeChat(cleaned).map((chunk) =>
+        chunk.length > maxLen ? chunk.slice(0, maxLen) + "\n...(已截断)" : chunk,
+      );
+      chunks[0] = `${header}\n\n${chunks[0]}`;
+    } else if (result.trim()) {
+      const preview = result.slice(0, 200).replace(/\n/g, " ");
+      chunks = [`${header}\n\n⚠️ AI 未生成有效回复。原始输出片段:\n${preview}`];
+    } else {
+      chunks = [`${header}\n\n⚠️ AI 无回复，可能执行超时或内部异常。`];
+    }
 
-    const message = `⏰ 定时任务 #${task.id}\n📋 ${task.description}\n\n${truncated}`;
-
-    client.send(task.userId, message).catch((err) => {
+    client.sendChunks(task.userId, chunks).catch((err) => {
       log(`❌ 推送失败 #${task.id}: ${String(err)}`);
     });
   });
@@ -175,7 +176,7 @@ export function formatTaskList(tasks: ScheduledTask[]): string {
   const lines = tasks.map((t) => {
     return `  #${t.id} | ${t.cron} | ${t.description}`;
   });
-  return `📋 定时任务列表:\n${lines.join("\n")}\n\n发送 /cancel <id> 取消任务`;
+  return `📋 定时任务列表:\n${lines.join("\n")}\n\n回复"取消任务"可管理任务`;
 }
 
 export function startReminder(
@@ -194,14 +195,21 @@ export function startReminder(
       log(`✅ 提醒任务完成 (${cleaned.length} 字符)`);
 
       const maxLen = 4000;
-      const truncated =
-        cleaned.length > maxLen
-          ? cleaned.slice(0, maxLen) + "\n...(已截断)"
-          : cleaned || "(无输出)";
+      const header = `🔔 提醒\n📋 ${opts.description}`;
+      let chunks: string[];
+      if (cleaned.trim()) {
+        chunks = splitForWeChat(cleaned).map((chunk) =>
+          chunk.length > maxLen ? chunk.slice(0, maxLen) + "\n...(已截断)" : chunk,
+        );
+        chunks[0] = `${header}\n\n${chunks[0]}`;
+      } else if (result.trim()) {
+        const preview = result.slice(0, 200).replace(/\n/g, " ");
+        chunks = [`${header}\n\n⚠️ AI 未生成有效回复。原始输出片段:\n${preview}`];
+      } else {
+        chunks = [`${header}\n\n⚠️ AI 无回复，可能执行超时或内部异常。`];
+      }
 
-      const message = `🔔 提醒\n📋 ${opts.description}\n\n${truncated}`;
-
-      client.send(opts.userId, message).catch((err) => {
+      client.sendChunks(opts.userId, chunks).catch((err) => {
         log(`❌ 提醒推送失败: ${String(err)}`);
       });
     });

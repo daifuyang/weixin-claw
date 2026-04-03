@@ -12,13 +12,17 @@ import type { WeixinMessage } from "../client/types.js";
 import { MessageType } from "../client/types.js";
 import { WeixinPoller, formatMessage, extractText } from "../poller/index.js";
 import { notify } from "../notifier/index.js";
-import { md2wx } from "../utils/md2wx.js";
+import { md2wx, splitForWeChat } from "../utils/md2wx.js";
+import { isDebug } from "../utils/paths.js";
 import {
   getActiveSession,
   setActiveSession,
   clearActiveSession,
   listSessions,
-  appendChat,
+  appendSummary,
+  archiveSession,
+  listMemories,
+  loadMemory,
 } from "../session/index.js";
 import {
   addSchedule,
@@ -72,12 +76,23 @@ function rotateIfNeeded(): void {
   } catch { /* file may not exist yet */ }
 }
 
+const IS_DEBUG = isDebug();
+
 function log(msg: string): void {
   const ts = new Date().toLocaleTimeString();
   console.log(`\x1b[90m[${ts}]\x1b[0m ${msg}`);
   rotateIfNeeded();
   const plain = msg.replace(/\x1b\[[0-9;]*m/g, "");
   logStream?.write(`[${ts}] ${plain}\n`);
+}
+
+function debug(msg: string): void {
+  if (!IS_DEBUG) return;
+  const ts = new Date().toLocaleTimeString();
+  console.log(`\x1b[90m[${ts}] [DEBUG]\x1b[0m ${msg}`);
+  rotateIfNeeded();
+  const plain = msg.replace(/\x1b\[[0-9;]*m/g, "");
+  logStream?.write(`[${ts}] [DEBUG] ${plain}\n`);
 }
 
 function printUsage(): never {
@@ -234,9 +249,9 @@ async function cmdPoll(): Promise<void> {
       if (tokens.size === 0) {
         log("没有缓存的 contextToken。");
       } else {
-        log(`已缓存 ${tokens.size} 个 contextToken:`);
+        debug(`已缓存 ${tokens.size} 个 contextToken:`);
         for (const [uid, tok] of tokens) {
-          log(`  ${uid} → ${tok.slice(0, 20)}...`);
+          debug(`  ${uid} → ${tok.slice(0, 20)}...`);
         }
       }
       updatePrompt();
@@ -394,12 +409,19 @@ interface OpencodeJsonEvent {
   part?: {
     type?: string;
     text?: string;
+    tool?: string;
+    state?: {
+      status?: string;
+      error?: string;
+      input?: Record<string, unknown>;
+    };
   };
 }
 
 function parseOpencodeOutput(raw: string): { sessionId: string; text: string } {
   let sessionId = "";
   const textParts: string[] = [];
+  const errors = new Set<string>();
 
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
@@ -411,29 +433,50 @@ function parseOpencodeOutput(raw: string): { sessionId: string; text: string } {
       if (event.type === "text" && event.part?.text) {
         textParts.push(event.part.text);
       }
+      if (event.type === "tool_use" && event.part?.state?.error) {
+        const tool = event.part.tool || "unknown";
+        const input = event.part.state.input;
+        const detail = input
+          ? (input.command || input.file_path || input.path || input.description || "")
+          : "";
+        const ctx = detail ? `\n   → ${String(detail).slice(0, 150)}` : "";
+        errors.add(`⚠️ [${tool}] ${event.part.state.error}${ctx}`);
+      }
     } catch {
       textParts.push(line);
     }
   }
 
-  return { sessionId, text: textParts.join("") };
+  let text = textParts.join("");
+  if (!text.trim() && errors.size > 0) {
+    text = [...errors].join("\n");
+  }
+
+  return { sessionId, text };
 }
 
 
-function buildOpencodeCmd(message: string, sessionId: string | null, userId?: string): string {
+function buildOpencodeCmd(message: string, sessionId: string | null, userId?: string, memory?: string): string {
   let content = message;
-  const hints: string[] = [
-    "[格式提示: 回复中涉及新闻/文章/话题时，必须用Markdown链接格式附带可访问的原始出处链接，如 [标题](https://具体文章url)。链接必须指向具体文章页面，严禁使用网站首页。如果找不到精确原文链接，请用搜索引擎链接代替，格式如：[标题](https://www.google.com/search?q=关键词)。系统会自动转换为微信可点击的超链接。]",
-  ];
+  const prefixes: string[] = [];
+  if (memory) {
+    prefixes.push(`[已加载的历史记忆]\n${memory}\n[/已加载的历史记忆]`);
+  }
   if (userId) {
+    const memories = listMemories(userId);
+    if (memories.length > 0) {
+      const memList = memories.map((m) => `#${m.index} [${m.date}] ${m.title}`).join("\n");
+      prefixes.push(`[历史记忆列表]\n${memList}\n[/历史记忆列表]`);
+    }
     const tasks = listSchedules(userId);
     if (tasks.length > 0) {
       const taskList = tasks.map((t) => `#${t.id} ${t.description} (${t.cron})`).join("\n");
-      hints.unshift(`[当前定时任务]\n${taskList}\n[/当前定时任务]`);
-      hints.push("[提示: 你可以用 <!--ACTION:cancel{\"task_id\":ID}--> 取消任务，用 <!--ACTION:schedule{...}--> 创建任务，用 <!--ACTION:remind{...}--> 设置提醒。请加载 weixin-assistant skill 了解详情。]");
+      prefixes.push(`[当前定时任务]\n${taskList}\n[/当前定时任务]`);
     }
   }
-  content = hints.join("\n") + "\n\n" + message;
+  if (prefixes.length > 0) {
+    content = prefixes.join("\n\n") + "\n\n" + message;
+  }
   const escaped = content.replace(/'/g, "'\\''");
   const parts = ["opencode", "run", "--format", "json"];
   if (sessionId) {
@@ -483,11 +526,11 @@ async function cmdAgent(): Promise<void> {
   console.log("  收到微信消息 → opencode run 处理 → 自动回复结果");
   console.log("  支持上下文记忆（每个用户独立会话）");
   console.log("  支持自然语言创建定时任务");
-  console.log("  指令: /new /sessions /tasks /cancel <id>");
+  console.log("  指令: /新会话 /任务 /记忆");
   console.log("  按 Ctrl+C 退出");
   console.log("");
   log(`已登录: accountId=${cred.accountId}`);
-  log(`会话存档: ~/weixin-claw/{userId}/{sessionId}/chat.md`);
+  log(`会话摘要: ~/.weixin-claw/{userId}/memory/`);
 
   startAllSchedules(client);
 
@@ -498,6 +541,7 @@ async function cmdAgent(): Promise<void> {
   const processing = new Set<string>();
   const handled = new Set<string>();
   const MAX_HANDLED = 500;
+  const activeMemory = new Map<string, string>();
 
   function dedup(msg: WeixinMessage): string {
     const id = msg.message_id ?? msg.seq;
@@ -516,7 +560,7 @@ async function cmdAgent(): Promise<void> {
 
     if (isBotMsg) {
       if (text && from) {
-        log(`🤖 [BOT→${msg.to_user_id?.split("@")[0] ?? "?"}]: ${text.slice(0, 200)}`);
+        debug(`🤖 [BOT→${msg.to_user_id?.split("@")[0] ?? "?"}]: ${text.slice(0, 200)}`);
       }
       return;
     }
@@ -525,7 +569,7 @@ async function cmdAgent(): Promise<void> {
 
     const msgKey = dedup(msg);
     if (!msgKey) {
-      log(`⏭️ 跳过重复消息: ${from}: ${text.slice(0, 40)}`);
+      debug(`⏭️ 跳过重复消息: ${from}: ${text.slice(0, 40)}`);
       return;
     }
     processing.add(msgKey);
@@ -533,15 +577,26 @@ async function cmdAgent(): Promise<void> {
     try {
       log(`👤 ${from}: ${text}`);
 
-      if (text.trim() === "/new") {
+      const input = text.trim();
+
+      if (input === "/new" || input === "/新会话") {
+        const prevSession = getActiveSession(from);
+        let archiveNote = "";
+        if (prevSession) {
+          const mem = archiveSession(from, prevSession);
+          if (mem) {
+            archiveNote = `\n💾 已归档: ${mem.title}`;
+          }
+        }
         clearActiveSession(from);
-        const reply = "✅ 已创建新会话，下一条消息将开始全新对话。";
+        activeMemory.delete(from);
+        const reply = `✅ 已创建新会话。${archiveNote}\n\n发送 /记忆 可查看并加载历史记忆。`;
         await client.send(from, reply);
         log(`🤖 回复: ${reply}`);
         return;
       }
 
-      if (text.trim() === "/sessions") {
+      if (input === "/sessions" || input === "/会话") {
         const sessions = listSessions(from);
         const reply = sessions.length
           ? `📋 你的会话记录:\n${sessions.map((s) => `  • ${s}`).join("\n")}`
@@ -551,7 +606,7 @@ async function cmdAgent(): Promise<void> {
         return;
       }
 
-      if (text.trim() === "/tasks") {
+      if (input === "/tasks" || input === "/任务") {
         const tasks = listSchedules(from);
         const reply = formatTaskList(tasks);
         await client.send(from, reply);
@@ -559,15 +614,29 @@ async function cmdAgent(): Promise<void> {
         return;
       }
 
-      const cancelMatch = text.trim().match(/^\/cancel\s+(\d+)$/);
-      if (cancelMatch) {
-        const taskId = parseInt(cancelMatch[1], 10);
-        const removed = removeSchedule(taskId);
-        const reply = removed
-          ? `✅ 已取消定时任务 #${taskId}`
-          : `❌ 未找到任务 #${taskId}`;
-        await client.send(from, reply);
-        log(`🤖 回复: ${reply}`);
+      if (input === "/memory" || input === "/记忆") {
+        const memories = listMemories(from);
+        if (memories.length === 0) {
+          await client.send(from, "📂 暂无历史记忆。对话结束后发送 /new 会自动归档。");
+        } else {
+          const loaded = activeMemory.has(from) ? "\n\n✅ 当前已加载记忆" : "";
+          const list = memories.map((m) => `  ${m.index}. [${m.date}] ${m.title}`).join("\n");
+          await client.send(from, `📂 历史记忆:\n${list}\n\n回复 /记忆 <编号> 加载到当前会话${loaded}`);
+        }
+        return;
+      }
+
+      const memoryLoadMatch = input.match(/^\/(memory|记忆)\s+(\d+)$/);
+      if (memoryLoadMatch) {
+        const idx = parseInt(memoryLoadMatch[2], 10);
+        const mem = loadMemory(from, idx);
+        if (mem) {
+          activeMemory.set(from, mem.content);
+          await client.send(from, `✅ 已加载记忆「${mem.title}」到当前会话上下文。`);
+          log(`💾 ${from} 加载了记忆: ${mem.title}`);
+        } else {
+          await client.send(from, `❌ 未找到编号 ${idx} 的记忆，请发送 /记忆 查看列表。`);
+        }
         return;
       }
 
@@ -579,15 +648,24 @@ async function cmdAgent(): Promise<void> {
 
       const stopTyping = await client.startTyping(from);
 
-      const cmd = buildOpencodeCmd(text, existingSession, from);
+      const cmd = buildOpencodeCmd(text, existingSession, from, activeMemory.get(from));
+      debug(`🔧 执行: ${cmd}`);
       let raw: string;
       try {
         raw = await runShellAsync(cmd, AGENT_TIMEOUT_MS);
       } catch (err) {
         await stopTyping();
-        const errMsg = `处理失败: ${String(err)}`;
-        log(`❌ ${errMsg}`);
-        await client.send(from, errMsg);
+        const errStr = String(err);
+        let friendlyMsg: string;
+        if (errStr.includes("ETIMEDOUT")) {
+          friendlyMsg = "⚠️ AI 处理超时，请简化问题后重试。";
+        } else if (errStr.includes("ENOENT")) {
+          friendlyMsg = "⚠️ opencode 未安装或无法找到，请检查服务器环境。";
+        } else {
+          friendlyMsg = `⚠️ AI 执行失败: ${errStr.slice(0, 200)}`;
+        }
+        log(`❌ ${friendlyMsg}`);
+        await client.send(from, friendlyMsg);
         return;
       }
 
@@ -596,11 +674,11 @@ async function cmdAgent(): Promise<void> {
       const { sessionId, text: replyText } = parseOpencodeOutput(raw);
       const { cleanText, actions } = parseActions(replyText);
       log(`✅ opencode 完成 (session=${sessionId.slice(0, 16)}..., ${cleanText.length} 字符, ${actions.length} 个 action)`);
+      debug(`📋 原始输出:\n${raw.slice(0, 800)}`);
 
       if (sessionId) {
         setActiveSession(from, sessionId);
-        appendChat(from, sessionId, "user", text);
-        appendChat(from, sessionId, "assistant", cleanText);
+        appendSummary(from, sessionId, text, cleanText, actions.length);
       }
 
       for (const action of actions) {
@@ -641,21 +719,41 @@ async function cmdAgent(): Promise<void> {
               ? `🗑️ ${from} 取消了任务 #${task_id}`
               : `❌ ${from} 尝试取消不存在的任务 #${task_id}`);
           }
+        } else if (action.type === "memory") {
+          const { index } = action.payload as { index: number };
+          if (index) {
+            const mem = loadMemory(from, index);
+            if (mem) {
+              activeMemory.set(from, mem.content);
+              log(`💾 AI 加载了记忆 #${index}: ${mem.title}`);
+            }
+          }
         }
       }
 
       const stripped = md2wx(cleanText);
       const maxLen = 4000;
-      const reply =
-        stripped.length > maxLen
-          ? stripped.slice(0, maxLen) + "\n...(已截断)"
-          : stripped || "(无输出)";
+      let chunks: string[];
+      if (stripped.trim()) {
+        chunks = splitForWeChat(stripped).map((chunk) =>
+          chunk.length > maxLen ? chunk.slice(0, maxLen) + "\n...(已截断)" : chunk,
+        );
+      } else if (raw.trim()) {
+        const preview = raw.slice(0, 200).replace(/\n/g, " ");
+        chunks = [`⚠️ AI 未生成有效回复。原始输出片段:\n${preview}`];
+      } else {
+        chunks = ["⚠️ AI 无回复，可能执行超时或内部异常，请稍后重试。"];
+      }
 
-      await client.send(from, reply);
-      log(`🤖 回复: ${reply}`);
+      await client.sendChunks(from, chunks);
+      log(`🤖 回复 (${chunks.length} 条): ${chunks.map((c) => c.slice(0, 60)).join(" | ")}`);
       log(`📤 已回复 → ${from}`);
     } catch (err) {
-      log(`❌ 处理异常: ${String(err)}`);
+      const errMsg = `⚠️ 处理异常: ${String(err)}`;
+      log(`❌ ${errMsg}`);
+      try {
+        await client.send(from, errMsg);
+      } catch { /* ignore send failure */ }
     } finally {
       processing.delete(msgKey);
       handled.add(msgKey);

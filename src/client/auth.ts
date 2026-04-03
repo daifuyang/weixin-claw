@@ -1,6 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 
 import { apiGet } from "./api.js";
 import type {
@@ -8,13 +6,14 @@ import type {
   StatusResponse,
   SavedCredentials,
 } from "./types.js";
+import { CREDENTIALS_FILE, DATA_DIR } from "../utils/paths.js";
 
 const FIXED_QR_BASE_URL = "https://ilinkai.weixin.qq.com";
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 const BOT_TYPE = "3";
 
 function defaultCredentialsPath(): string {
-  return path.join(os.homedir(), ".weixin-claw.json");
+  return CREDENTIALS_FILE;
 }
 
 export function loadCredentials(
@@ -34,6 +33,7 @@ export function saveCredentials(
   filePath?: string,
 ): void {
   const p = filePath ?? defaultCredentialsPath();
+  fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.writeFileSync(p, JSON.stringify(cred, null, 2), "utf-8");
   try {
     fs.chmodSync(p, 0o600);
