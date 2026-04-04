@@ -19,10 +19,10 @@ import {
   setActiveSession,
   clearActiveSession,
   listSessions,
-  appendSummary,
-  archiveSession,
+  saveMemory,
   listMemories,
   loadMemory,
+  writeSessionContext,
 } from "../session/index.js";
 import {
   addSchedule,
@@ -456,28 +456,8 @@ function parseOpencodeOutput(raw: string): { sessionId: string; text: string } {
 }
 
 
-function buildOpencodeCmd(message: string, sessionId: string | null, userId?: string, memory?: string): string {
-  let content = message;
-  const prefixes: string[] = [];
-  if (memory) {
-    prefixes.push(`[已加载的历史记忆]\n${memory}\n[/已加载的历史记忆]`);
-  }
-  if (userId) {
-    const memories = listMemories(userId);
-    if (memories.length > 0) {
-      const memList = memories.map((m) => `#${m.index} [${m.date}] ${m.title}`).join("\n");
-      prefixes.push(`[历史记忆列表]\n${memList}\n[/历史记忆列表]`);
-    }
-    const tasks = listSchedules(userId);
-    if (tasks.length > 0) {
-      const taskList = tasks.map((t) => `#${t.id} ${t.description} (${t.cron})`).join("\n");
-      prefixes.push(`[当前定时任务]\n${taskList}\n[/当前定时任务]`);
-    }
-  }
-  if (prefixes.length > 0) {
-    content = prefixes.join("\n\n") + "\n\n" + message;
-  }
-  const escaped = content.replace(/'/g, "'\\''");
+function buildOpencodeCmd(message: string, sessionId: string | null): string {
+  const escaped = message.replace(/'/g, "'\\''");
   const parts = ["opencode", "run", "--format", "json"];
   if (sessionId) {
     parts.push("--session", sessionId);
@@ -581,18 +561,33 @@ async function cmdAgent(): Promise<void> {
 
       if (input === "/new" || input === "/新会话") {
         const prevSession = getActiveSession(from);
-        let archiveNote = "";
-        if (prevSession) {
-          const mem = archiveSession(from, prevSession);
-          if (mem) {
-            archiveNote = `\n💾 已归档: ${mem.title}`;
-          }
-        }
         clearActiveSession(from);
         activeMemory.delete(from);
-        const reply = `✅ 已创建新会话。${archiveNote}\n\n发送 /记忆 可查看并加载历史记忆。`;
-        await client.send(from, reply);
-        log(`🤖 回复: ${reply}`);
+
+        if (prevSession) {
+          await client.send(from, "🔄 正在归档当前会话...");
+          const summarizeCmd = buildOpencodeCmd(
+            "请用3-5句话总结这次对话的关键内容和用户偏好，第一行是10字以内的标题。只输出总结，不要其他内容。",
+            prevSession,
+          );
+          try {
+            const raw = await runShellAsync(summarizeCmd, 60_000);
+            const summary = parseOpencodeOutput(raw);
+            const text = summary.text.trim();
+            if (text) {
+              const lines = text.split("\n");
+              const title = lines[0].replace(/^#+\s*/, "").slice(0, 20);
+              const mem = saveMemory(from, title, text);
+              await client.send(from, `✅ 新会话已创建。\n💾 已归档: ${mem.title}\n\n发送 /记忆 可查看并加载历史记忆。`);
+              log(`💾 归档记忆: ${mem.title}`);
+              return;
+            }
+          } catch (e) {
+            log(`⚠️ 归档总结失败: ${String(e)}`);
+          }
+        }
+
+        await client.send(from, "✅ 新会话已创建。\n\n发送 /记忆 可查看并加载历史记忆。");
         return;
       }
 
@@ -648,7 +643,13 @@ async function cmdAgent(): Promise<void> {
 
       const stopTyping = await client.startTyping(from);
 
-      const cmd = buildOpencodeCmd(text, existingSession, from, activeMemory.get(from));
+      writeSessionContext({
+        memories: listMemories(from),
+        tasks: listSchedules(from).map((t) => ({ id: t.id, description: t.description, cron: t.cron })),
+        loadedMemory: activeMemory.get(from),
+      });
+
+      const cmd = buildOpencodeCmd(text, existingSession);
       debug(`🔧 执行: ${cmd}`);
       let raw: string;
       try {
@@ -678,7 +679,6 @@ async function cmdAgent(): Promise<void> {
 
       if (sessionId) {
         setActiveSession(from, sessionId);
-        appendSummary(from, sessionId, text, cleanText, actions.length);
       }
 
       for (const action of actions) {

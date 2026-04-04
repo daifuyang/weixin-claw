@@ -4,3 +4,4 @@ dist/
 *.tsbuildinfo
 .pnpm-store/
 logs/
+.opencode/context.md

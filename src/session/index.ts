@@ -68,26 +68,6 @@ export function listSessions(userId: string): string[] {
     .map((d) => d.name);
 }
 
-export function appendSummary(
-  userId: string,
-  sessionId: string,
-  question: string,
-  answer: string,
-  actions: number,
-): void {
-  const dir = sessionDir(userId, sessionId);
-  fs.mkdirSync(dir, { recursive: true });
-
-  const chatFile = path.join(dir, "chat.md");
-  const timestamp = new Date().toLocaleString();
-  const q = question.length > 80 ? question.slice(0, 80) + "…" : question;
-  const a = answer.length > 120 ? answer.slice(0, 120) + "…" : answer;
-  const actionNote = actions > 0 ? ` | ${actions} action` : "";
-  const entry = `- **${timestamp}**${actionNote}\n  Q: ${q}\n  A: ${a}\n`;
-
-  fs.appendFileSync(chatFile, entry, "utf-8");
-}
-
 function memoryDir(userId: string): string {
   return path.join(userDir(userId), "memory");
 }
@@ -99,15 +79,8 @@ export interface MemoryFile {
   date: string;
 }
 
-export function archiveSession(userId: string, sessionId: string): MemoryFile | null {
-  const chatFile = path.join(sessionDir(userId, sessionId), "chat.md");
-  if (!fs.existsSync(chatFile)) return null;
-
-  const content = fs.readFileSync(chatFile, "utf-8").trim();
-  if (!content) return null;
-
-  const firstQ = content.match(/Q: (.+)/)?.[1] ?? "对话";
-  const slug = firstQ.slice(0, 20).replace(/[\/\\:*?"<>|]/g, "").trim();
+export function saveMemory(userId: string, title: string, content: string): MemoryFile {
+  const slug = title.slice(0, 20).replace(/[\/\\:*?"<>|]/g, "").trim() || "对话";
   const now = new Date();
   const date = now.toISOString().slice(0, 10);
   const time = `${String(now.getHours()).padStart(2, "0")}-${String(now.getMinutes()).padStart(2, "0")}`;
@@ -115,8 +88,7 @@ export function archiveSession(userId: string, sessionId: string): MemoryFile | 
 
   const dir = memoryDir(userId);
   fs.mkdirSync(dir, { recursive: true });
-  const header = `# ${slug}\n\n`;
-  fs.writeFileSync(path.join(dir, filename), header + content, "utf-8");
+  fs.writeFileSync(path.join(dir, filename), `# ${slug}\n\n${content}`, "utf-8");
 
   return { index: 0, filename, title: slug, date };
 }
@@ -148,4 +120,35 @@ export function loadMemory(userId: string, index: number): { title: string; cont
   const dir = memoryDir(userId);
   const raw = fs.readFileSync(path.join(dir, mem.filename), "utf-8");
   return { title: mem.title, content: raw };
+}
+
+export interface SessionContext {
+  memories: MemoryFile[];
+  tasks: { id: number; description: string; cron: string }[];
+  loadedMemory?: string;
+}
+
+export function writeSessionContext(ctx: SessionContext): void {
+  const sections: string[] = [];
+
+  if (ctx.loadedMemory) {
+    sections.push(`## 已加载的历史记忆\n\n${ctx.loadedMemory}`);
+  }
+
+  if (ctx.memories.length > 0) {
+    const list = ctx.memories.map((m) => `- #${m.index} [${m.date}] ${m.title}`).join("\n");
+    sections.push(`## 历史记忆列表\n\n${list}\n\n用户可发送 /记忆 <编号> 加载指定记忆。`);
+  }
+
+  if (ctx.tasks.length > 0) {
+    const list = ctx.tasks.map((t) => `- #${t.id} ${t.description} (${t.cron})`).join("\n");
+    sections.push(`## 当前定时任务\n\n${list}`);
+  }
+
+  const contextDir = path.join(process.cwd(), ".opencode");
+  fs.mkdirSync(contextDir, { recursive: true });
+  const content = sections.length > 0
+    ? `# 用户上下文\n\n${sections.join("\n\n---\n\n")}\n`
+    : "";
+  fs.writeFileSync(path.join(contextDir, "context.md"), content, "utf-8");
 }
