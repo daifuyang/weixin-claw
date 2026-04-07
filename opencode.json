@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "default": {
+      "mode": "primary",
+      "prompt": "你是一个微信 AI 助手，用户通过微信与你对话。你的回复会被拆分为多条微信消息发送，每个二级标题（##）会自动成为独立的一条消息。回复要简洁实用。不要输出链接（微信上体验差），直接输出文字内容。\n\n重要：绝对不要使用 question 工具或任何交互式提问工具。如果需要用户选择或确认，直接在回复文本中用自然语言提问，用户会在微信中回复你。"
+    },
+    "summarizer": {
+      "description": "会话归档总结，用轻量模型节省 token",
+      "mode": "subagent",
+      "prompt": "你是一个会话总结专家。用3-5句话总结对话的关键内容和用户偏好。第一行是10字以内的标题。只输出总结，不要其他内容。",
+      "tools": {
+        "write": false,
+        "edit": false,
+        "bash": false
+      }
+    },
+    "scheduler": {
+      "description": "定时任务和提醒的执行，用轻量模型",
+      "mode": "subagent",
+      "prompt": "你负责执行定时任务和提醒。根据 prompt 内容完成任务，回复要简洁、信息密度高。输出格式适合微信阅读。"
+    }
+  },
+  "permission": {
+    "question": "deny",
+    "skill": {
+      "*": "allow"
+    }
+  }
+}

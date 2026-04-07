@@ -2,7 +2,7 @@
 
 import { parseArgs } from "node:util";
 import readline from "node:readline";
-import { execSync, spawn } from "node:child_process";
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -15,6 +15,12 @@ import { notify } from "../notifier/index.js";
 import { md2wx, splitForWeChat } from "../utils/md2wx.js";
 import { isDebug } from "../utils/paths.js";
 import {
+  runOpencode,
+  healthCheck,
+  parseActions,
+  friendlyError,
+} from "../opencode/index.js";
+import {
   getActiveSession,
   setActiveSession,
   clearActiveSession,
@@ -23,6 +29,8 @@ import {
   listMemories,
   loadMemory,
   writeSessionContext,
+  getUserCwd,
+  setUserCwd,
 } from "../session/index.js";
 import {
   addSchedule,
@@ -352,119 +360,7 @@ async function cmdTask(argv: string[]): Promise<void> {
   log("✅ 结果已推送到微信");
 }
 
-const AGENT_TIMEOUT_MS = 24 * 60 * 60_000;
-
-function runShellAsync(cmd: string, timeoutMs: number): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn("/bin/sh", ["-c", cmd], {
-      timeout: timeoutMs,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-
-    child.on("close", (code) => {
-      if (code === 0) {
-        resolve(stdout.trim());
-      } else {
-        reject(new Error(`exit ${code}: ${stderr.trim() || stdout.trim()}`));
-      }
-    });
-
-    child.on("error", (err) => {
-      reject(err);
-    });
-  });
-}
-
-interface AgentAction {
-  type: string;
-  payload: Record<string, unknown>;
-}
-
-function parseActions(text: string): { cleanText: string; actions: AgentAction[] } {
-  const actions: AgentAction[] = [];
-  const actionRegex = /<!--ACTION:(\w+)(\{[\s\S]*?\})-->/g;
-
-  let cleanText = text;
-  let match: RegExpExecArray | null;
-
-  while ((match = actionRegex.exec(text)) !== null) {
-    try {
-      const payload = JSON.parse(match[2]);
-      actions.push({ type: match[1], payload });
-    } catch {}
-  }
-
-  cleanText = cleanText.replace(/\s*<!--ACTION:\w+\{[\s\S]*?\}-->\s*/g, "").trim();
-  return { cleanText, actions };
-}
-
-interface OpencodeJsonEvent {
-  type: string;
-  sessionID?: string;
-  part?: {
-    type?: string;
-    text?: string;
-    tool?: string;
-    state?: {
-      status?: string;
-      error?: string;
-      input?: Record<string, unknown>;
-    };
-  };
-}
-
-function parseOpencodeOutput(raw: string): { sessionId: string; text: string } {
-  let sessionId = "";
-  const textParts: string[] = [];
-  const errors = new Set<string>();
-
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const event: OpencodeJsonEvent = JSON.parse(line);
-      if (event.sessionID && !sessionId) {
-        sessionId = event.sessionID;
-      }
-      if (event.type === "text" && event.part?.text) {
-        textParts.push(event.part.text);
-      }
-      if (event.type === "tool_use" && event.part?.state?.error) {
-        const tool = event.part.tool || "unknown";
-        const input = event.part.state.input;
-        const detail = input
-          ? (input.command || input.file_path || input.path || input.description || "")
-          : "";
-        const ctx = detail ? `\n   → ${String(detail).slice(0, 150)}` : "";
-        errors.add(`⚠️ [${tool}] ${event.part.state.error}${ctx}`);
-      }
-    } catch {
-      textParts.push(line);
-    }
-  }
-
-  let text = textParts.join("");
-  if (!text.trim() && errors.size > 0) {
-    text = [...errors].join("\n");
-  }
-
-  return { sessionId, text };
-}
-
-
-function buildOpencodeCmd(message: string, sessionId: string | null): string {
-  const escaped = message.replace(/'/g, "'\\''");
-  const parts = ["opencode", "run", "--format", "json"];
-  if (sessionId) {
-    parts.push("--session", sessionId);
-  }
-  parts.push(`'${escaped}'`);
-  return parts.join(" ");
-}
+const AGENT_TIMEOUT_MS = 5 * 60_000;
 
 const LOCK_FILE = path.join(os.tmpdir(), "weixin-claw-agent.lock");
 
@@ -503,35 +399,50 @@ async function cmdAgent(): Promise<void> {
   console.log("  weixin-claw AI 代理模式");
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log("\x1b[0m");
-  console.log("  收到微信消息 → opencode run 处理 → 自动回复结果");
-  console.log("  支持上下文记忆（每个用户独立会话）");
-  console.log("  支持自然语言创建定时任务");
-  console.log("  指令: /新会话 /任务 /记忆");
+  console.log("  收到微信消息 → opencode web 处理 → 自动回复结果");
+  console.log("");
+  console.log("  \x1b[33m指令:\x1b[0m");
+  console.log("    /新会话 [路径]   归档当前会话，可选切换工作目录");
+  console.log("    /任务            查看定时任务");
+  console.log("    /记忆 [编号]     查看/加载历史记忆");
+  console.log("    /cd <路径>       切换工作目录");
+  console.log("    /pwd             查看当前工作目录");
+  console.log("");
   console.log("  按 Ctrl+C 退出");
   console.log("");
   log(`已登录: accountId=${cred.accountId}`);
-  log(`会话摘要: ~/.weixin-claw/{userId}/memory/`);
+
+  try {
+    const health = await healthCheck();
+    log(`✅ opencode web 已连接 (v${health.version})`);
+  } catch (err) {
+    log(`❌ 无法连接 opencode web: ${String(err).slice(0, 100)}`);
+    log(`   请先启动: opencode web`);
+    log(`   或设置 OPENCODE_URL 环境变量指向正确地址`);
+    process.exit(1);
+  }
 
   startAllSchedules(client);
 
-  await client.drain();
+  if (cred.userId) {
+    const welcome = [
+      "🤖 weixin-claw 已上线",
+      "",
+      "可用指令:",
+      "  /新会话 [路径] — 新建会话（可指定工作目录）",
+      "  /任务 — 查看定时任务",
+      "  /记忆 [编号] — 查看/加载历史记忆",
+      "  /cd <路径> — 切换工作目录",
+      "  /pwd — 查看当前工作目录",
+      "",
+      "也可以直接发消息与 AI 对话。",
+    ].join("\n");
+    client.send(cred.userId, welcome).catch(() => {});
+  }
 
   log("等待消息...\n");
 
-  const processing = new Set<string>();
-  const handled = new Set<string>();
-  const MAX_HANDLED = 500;
   const activeMemory = new Map<string, string>();
-
-  function dedup(msg: WeixinMessage): string {
-    const id = msg.message_id ?? msg.seq;
-    const key = id != null
-      ? `${msg.from_user_id}:${id}`
-      : `${msg.from_user_id}:${Date.now()}:${Math.random()}`;
-    if (handled.has(key)) return "";
-    if (processing.has(key)) return "";
-    return key;
-  }
 
   poller.on("message", async (msg) => {
     const text = extractText(msg);
@@ -547,38 +458,44 @@ async function cmdAgent(): Promise<void> {
 
     if (!text || !from) return;
 
-    const msgKey = dedup(msg);
-    if (!msgKey) {
-      debug(`⏭️ 跳过重复消息: ${from}: ${text.slice(0, 40)}`);
-      return;
-    }
-    processing.add(msgKey);
-
     try {
       log(`👤 ${from}: ${text}`);
 
       const input = text.trim();
 
-      if (input === "/new" || input === "/新会话") {
+      const newMatch = input.match(/^\/(new|新会话)(?:\s+(.+))?$/);
+      if (newMatch) {
+        const pathArg = newMatch[2]?.trim();
         const prevSession = getActiveSession(from);
         clearActiveSession(from);
         activeMemory.delete(from);
 
+        if (pathArg) {
+          const expanded = pathArg.replace(/^~/, os.homedir());
+          const currentCwd = getUserCwd(from);
+          const resolved = path.resolve(currentCwd || process.cwd(), expanded);
+          if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+            setUserCwd(from, resolved);
+          } else {
+            await client.send(from, `❌ 目录不存在: ${resolved}`);
+            return;
+          }
+        }
+
         if (prevSession) {
           await client.send(from, "🔄 正在归档当前会话...");
-          const summarizeCmd = buildOpencodeCmd(
-            "请用3-5句话总结这次对话的关键内容和用户偏好，第一行是10字以内的标题。只输出总结，不要其他内容。",
-            prevSession,
-          );
           try {
-            const raw = await runShellAsync(summarizeCmd, 60_000);
-            const summary = parseOpencodeOutput(raw);
-            const text = summary.text.trim();
+            const result = await runOpencode(
+              "请用3-5句话总结这次对话的关键内容和用户偏好，第一行是10字以内的标题。只输出总结，不要其他内容。",
+              { sessionId: prevSession, timeoutMs: 60_000, agent: "summarizer" },
+            );
+            const text = result.text.trim();
             if (text) {
               const lines = text.split("\n");
               const title = lines[0].replace(/^#+\s*/, "").slice(0, 20);
               const mem = saveMemory(from, title, text);
-              await client.send(from, `✅ 新会话已创建。\n💾 已归档: ${mem.title}\n\n发送 /记忆 可查看并加载历史记忆。`);
+              const cwdInfo = pathArg ? `\n📂 工作目录: ${getUserCwd(from)}` : "";
+              await client.send(from, `✅ 新会话已创建。\n💾 已归档: ${mem.title}${cwdInfo}\n\n直接发消息开始对话，或使用指令:\n/记忆 [编号] · /任务 · /cd <路径> · /pwd`);
               log(`💾 归档记忆: ${mem.title}`);
               return;
             }
@@ -587,7 +504,8 @@ async function cmdAgent(): Promise<void> {
           }
         }
 
-        await client.send(from, "✅ 新会话已创建。\n\n发送 /记忆 可查看并加载历史记忆。");
+        const cwdInfo = pathArg ? `\n📂 工作目录: ${getUserCwd(from)}` : "";
+        await client.send(from, `✅ 新会话已创建。${cwdInfo}\n\n直接发消息开始对话，或使用指令:\n/记忆 [编号] · /任务 · /cd <路径> · /pwd`);
         return;
       }
 
@@ -635,10 +553,36 @@ async function cmdAgent(): Promise<void> {
         return;
       }
 
+      if (input === "/pwd") {
+        const cwd = getUserCwd(from);
+        const reply = cwd
+          ? `📂 当前工作目录: ${cwd}`
+          : "📂 当前工作目录: (默认项目目录)";
+        await client.send(from, reply);
+        return;
+      }
+
+      const cdMatch = input.match(/^\/cd\s+(.+)$/);
+      if (cdMatch) {
+        const targetPath = cdMatch[1].trim().replace(/^~/, os.homedir());
+        const currentCwd = getUserCwd(from);
+        const resolved = path.resolve(currentCwd || process.cwd(), targetPath);
+        if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+          setUserCwd(from, resolved);
+          await client.send(from, `📂 工作目录已切换到: ${resolved}`);
+          log(`📂 ${from} 切换目录: ${resolved}`);
+        } else {
+          await client.send(from, `❌ 目录不存在: ${resolved}`);
+        }
+        return;
+      }
+
       const existingSession = getActiveSession(from);
+      const userCwd = getUserCwd(from) ?? undefined;
       log(
         `📨 opencode 处理中...` +
-          (existingSession ? ` [续接 ${existingSession.slice(0, 16)}...]` : " [新会话]"),
+          (existingSession ? ` [续接 ${existingSession.slice(0, 16)}...]` : " [新会话]") +
+          (userCwd ? ` [cwd=${userCwd}]` : ""),
       );
 
       const stopTyping = await client.startTyping(from);
@@ -647,35 +591,30 @@ async function cmdAgent(): Promise<void> {
         memories: listMemories(from),
         tasks: listSchedules(from).map((t) => ({ id: t.id, description: t.description, cron: t.cron })),
         loadedMemory: activeMemory.get(from),
+        cwd: userCwd,
       });
 
-      const cmd = buildOpencodeCmd(text, existingSession);
-      debug(`🔧 执行: ${cmd}`);
-      let raw: string;
+      debug(`🔧 opencode web → session=${existingSession || "(new)"}${userCwd ? ` cwd=${userCwd}` : ""} timeout=${AGENT_TIMEOUT_MS / 1000}s`);
+      const t0 = Date.now();
+      let result: Awaited<ReturnType<typeof runOpencode>>;
       try {
-        raw = await runShellAsync(cmd, AGENT_TIMEOUT_MS);
+        result = await runOpencode(text, { sessionId: existingSession, timeoutMs: AGENT_TIMEOUT_MS, cwd: userCwd });
       } catch (err) {
+        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
         await stopTyping();
-        const errStr = String(err);
-        let friendlyMsg: string;
-        if (errStr.includes("ETIMEDOUT")) {
-          friendlyMsg = "⚠️ AI 处理超时，请简化问题后重试。";
-        } else if (errStr.includes("ENOENT")) {
-          friendlyMsg = "⚠️ opencode 未安装或无法找到，请检查服务器环境。";
-        } else {
-          friendlyMsg = `⚠️ AI 执行失败: ${errStr.slice(0, 200)}`;
-        }
-        log(`❌ ${friendlyMsg}`);
+        const friendlyMsg = friendlyError(err);
+        log(`❌ opencode 失败 (${elapsed}s): ${friendlyMsg}`);
+        debug(`❌ 原始错误: ${String(err)}`);
         await client.send(from, friendlyMsg);
         return;
       }
 
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       await stopTyping();
 
-      const { sessionId, text: replyText } = parseOpencodeOutput(raw);
+      const { sessionId, text: replyText } = result;
       const { cleanText, actions } = parseActions(replyText);
-      log(`✅ opencode 完成 (session=${sessionId.slice(0, 16)}..., ${cleanText.length} 字符, ${actions.length} 个 action)`);
-      debug(`📋 原始输出:\n${raw.slice(0, 800)}`);
+      log(`✅ opencode 完成 (${elapsed}s, session=${sessionId.slice(0, 16)}..., ${cleanText.length} 字符, ${actions.length} 个 action)`);
 
       if (sessionId) {
         setActiveSession(from, sessionId);
@@ -728,6 +667,19 @@ async function cmdAgent(): Promise<void> {
               log(`💾 AI 加载了记忆 #${index}: ${mem.title}`);
             }
           }
+        } else if (action.type === "cd") {
+          const { path: targetPath } = action.payload as { path: string };
+          if (targetPath) {
+            const expanded = targetPath.replace(/^~/, os.homedir());
+            const currentCwd = getUserCwd(from);
+            const resolved = path.resolve(currentCwd || process.cwd(), expanded);
+            if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+              setUserCwd(from, resolved);
+              log(`📂 AI 切换目录: ${resolved}`);
+            } else {
+              log(`❌ AI 尝试切换到不存在的目录: ${resolved}`);
+            }
+          }
         }
       }
 
@@ -738,8 +690,8 @@ async function cmdAgent(): Promise<void> {
         chunks = splitForWeChat(stripped).map((chunk) =>
           chunk.length > maxLen ? chunk.slice(0, maxLen) + "\n...(已截断)" : chunk,
         );
-      } else if (raw.trim()) {
-        const preview = raw.slice(0, 200).replace(/\n/g, " ");
+      } else if (replyText.trim()) {
+        const preview = replyText.slice(0, 200).replace(/\n/g, " ");
         chunks = [`⚠️ AI 未生成有效回复。原始输出片段:\n${preview}`];
       } else {
         chunks = ["⚠️ AI 无回复，可能执行超时或内部异常，请稍后重试。"];
@@ -754,13 +706,6 @@ async function cmdAgent(): Promise<void> {
       try {
         await client.send(from, errMsg);
       } catch { /* ignore send failure */ }
-    } finally {
-      processing.delete(msgKey);
-      handled.add(msgKey);
-      if (handled.size > MAX_HANDLED) {
-        const first = handled.values().next().value!;
-        handled.delete(first);
-      }
     }
   });
 

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { DATA_DIR, SESSIONS_FILE, userDataDir } from "../utils/paths.js";
+import { DATA_DIR, SESSIONS_FILE, ARTIFACTS_DIR, userDataDir } from "../utils/paths.js";
 
 function userDir(userId: string): string {
   return userDataDir(userId);
@@ -19,6 +19,7 @@ interface SessionIndex {
   [userId: string]: {
     activeSessionId: string;
     createdAt: string;
+    cwd?: string;
   };
 }
 
@@ -56,6 +57,21 @@ export function setActiveSession(userId: string, sessionId: string): void {
 export function clearActiveSession(userId: string): void {
   const index = loadIndex();
   delete index[userId];
+  saveIndex(index);
+}
+
+export function getUserCwd(userId: string): string | null {
+  const index = loadIndex();
+  return index[userId]?.cwd ?? null;
+}
+
+export function setUserCwd(userId: string, cwd: string): void {
+  const index = loadIndex();
+  if (!index[userId]) {
+    index[userId] = { activeSessionId: "", createdAt: new Date().toISOString(), cwd };
+  } else {
+    index[userId].cwd = cwd;
+  }
   saveIndex(index);
 }
 
@@ -126,10 +142,18 @@ export interface SessionContext {
   memories: MemoryFile[];
   tasks: { id: number; description: string; cron: string }[];
   loadedMemory?: string;
+  cwd?: string;
 }
 
 export function writeSessionContext(ctx: SessionContext): void {
   const sections: string[] = [];
+
+  fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
+  sections.push(`## AI 产出目录\n\n\`${ARTIFACTS_DIR}\`\n\n当需要创建文件（如记录、报告、日志等）时，请写入此目录而非项目根目录。`);
+
+  if (ctx.cwd) {
+    sections.push(`## 当前工作目录\n\n\`${ctx.cwd}\`\n\nopencode 将在此目录下执行。用户可发送 /cd <路径> 切换，或 /pwd 查看。`);
+  }
 
   if (ctx.loadedMemory) {
     sections.push(`## 已加载的历史记忆\n\n${ctx.loadedMemory}`);

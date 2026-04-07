@@ -1,9 +1,8 @@
 import fs from "node:fs";
-import path from "node:path";
-import { spawn } from "node:child_process";
 import { Cron } from "croner";
 
 import { WeixinClient } from "../client/index.js";
+import { runOpencode } from "../opencode/index.js";
 import { md2wx, splitForWeChat } from "../utils/md2wx.js";
 import { DATA_DIR, SCHEDULES_FILE } from "../utils/paths.js";
 
@@ -78,40 +77,12 @@ function log(msg: string): void {
   console.log(`\x1b[90m[${ts}]\x1b[0m ${msg}`);
 }
 
-function runOpencode(prompt: string, timeoutMs = 24 * 60 * 60_000): Promise<string> {
-  return new Promise((resolve) => {
-    const escaped = prompt.replace(/'/g, "'\\''");
-    const child = spawn("opencode", ["run", `${escaped}`], {
-      shell: true,
-      timeout: timeoutMs,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-
-    child.on("close", (code) => {
-      if (code === 0) {
-        resolve(stdout.trim());
-      } else {
-        resolve(`执行失败 (code=${code}): ${stderr.trim() || stdout.trim()}`);
-      }
-    });
-
-    child.on("error", (err) => {
-      resolve(`执行出错: ${String(err)}`);
-    });
-  });
-}
-
 
 function executeTask(task: ScheduledTask, client: WeixinClient): void {
   log(`⏰ 执行定时任务 #${task.id}: ${task.description}`);
 
-  runOpencode(task.prompt).then((result) => {
-    const cleaned = md2wx(result);
+  runOpencode(task.prompt, { agent: "scheduler" }).then((result) => {
+    const cleaned = md2wx(result.text);
     log(`✅ 任务 #${task.id} 完成 (${cleaned.length} 字符)`);
 
     const maxLen = 4000;
@@ -122,8 +93,8 @@ function executeTask(task: ScheduledTask, client: WeixinClient): void {
         chunk.length > maxLen ? chunk.slice(0, maxLen) + "\n...(已截断)" : chunk,
       );
       chunks[0] = `${header}\n\n${chunks[0]}`;
-    } else if (result.trim()) {
-      const preview = result.slice(0, 200).replace(/\n/g, " ");
+    } else if (result.text.trim()) {
+      const preview = result.text.slice(0, 200).replace(/\n/g, " ");
       chunks = [`${header}\n\n⚠️ AI 未生成有效回复。原始输出片段:\n${preview}`];
     } else {
       chunks = [`${header}\n\n⚠️ AI 无回复，可能执行超时或内部异常。`];
@@ -132,6 +103,11 @@ function executeTask(task: ScheduledTask, client: WeixinClient): void {
     client.sendChunks(task.userId, chunks).catch((err) => {
       log(`❌ 推送失败 #${task.id}: ${String(err)}`);
     });
+  }).catch((err) => {
+    const header = `⏰ 定时任务 #${task.id}\n📋 ${task.description}`;
+    const chunks = [`${header}\n\n⚠️ 执行失败: ${String(err).slice(0, 200)}`];
+    client.sendChunks(task.userId, chunks).catch(() => {});
+    log(`❌ 任务 #${task.id} 执行失败: ${String(err)}`);
   });
 }
 
@@ -190,8 +166,8 @@ export function startReminder(
   new Cron(isoLocal, { maxRuns: 1 }, () => {
     log(`🔔 执行提醒: ${opts.description}`);
 
-    runOpencode(opts.prompt).then((result) => {
-      const cleaned = md2wx(result);
+    runOpencode(opts.prompt, { agent: "scheduler" }).then((result) => {
+      const cleaned = md2wx(result.text);
       log(`✅ 提醒任务完成 (${cleaned.length} 字符)`);
 
       const maxLen = 4000;
@@ -202,8 +178,8 @@ export function startReminder(
           chunk.length > maxLen ? chunk.slice(0, maxLen) + "\n...(已截断)" : chunk,
         );
         chunks[0] = `${header}\n\n${chunks[0]}`;
-      } else if (result.trim()) {
-        const preview = result.slice(0, 200).replace(/\n/g, " ");
+      } else if (result.text.trim()) {
+        const preview = result.text.slice(0, 200).replace(/\n/g, " ");
         chunks = [`${header}\n\n⚠️ AI 未生成有效回复。原始输出片段:\n${preview}`];
       } else {
         chunks = [`${header}\n\n⚠️ AI 无回复，可能执行超时或内部异常。`];
@@ -212,6 +188,11 @@ export function startReminder(
       client.sendChunks(opts.userId, chunks).catch((err) => {
         log(`❌ 提醒推送失败: ${String(err)}`);
       });
+    }).catch((err) => {
+      const header = `🔔 提醒\n📋 ${opts.description}`;
+      const chunks = [`${header}\n\n⚠️ 执行失败: ${String(err).slice(0, 200)}`];
+      client.sendChunks(opts.userId, chunks).catch(() => {});
+      log(`❌ 提醒执行失败: ${String(err)}`);
     });
   });
 }

@@ -9,6 +9,7 @@ export const CREDENTIALS_FILE = path.join(DATA_DIR, "credentials.json");
 export const SCHEDULES_FILE = path.join(DATA_DIR, "schedules.json");
 export const SESSIONS_FILE = path.join(DATA_DIR, "sessions.json");
 export const CONFIG_FILE = path.join(DATA_DIR, "config.json");
+export const ARTIFACTS_DIR = path.join(DATA_DIR, "artifacts");
 
 export function userDataDir(userId: string): string {
   const safe = userId.replace(/[^a-zA-Z0-9@._-]/g, "_");
